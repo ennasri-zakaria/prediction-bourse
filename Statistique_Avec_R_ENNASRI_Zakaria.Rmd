@@ -1,0 +1,489 @@
+---
+title: "Projet Statistique avec R"
+output: 
+  html_document:
+    df_print: paged
+  word_document: default
+  pdf_document:
+    latex_engine: xelatex
+author: ENNASRI Zakaria
+date: '2025-03-12'
+---
+
+## 1. Introduction
+
+Ce projet a pour objectif de modéliser l’évolution du prix des actions en bourse à l’aide d’un modèle simple, dans lequel le prix d’une action à un jour donné dépend du prix de la veille et de la variation observée entre les deux jours précédents, pondérée par un coefficient $\beta$. En plus de cela, on suppose l'existence d'un drift $\alpha$ et d'un bruit gaussien de variance $\sigma^2$. Toutes les variations sont relatives au prix de l'action. Cela nous conduit au modèle suivant pour le prix $P_t$ au jour $t$ :
+
+$$
+P_t = P_{t-1} + P_{t-1} \left(\alpha + \beta (P_{t-1} - P_{t-2}) + \epsilon_t\right), \quad \epsilon_t \sim \mathcal{N}(0, \sigma^2)
+$$
+
+Nous disposons également des prix de trois actions supposées indépendantes pour les années 2022 et 2023, fournis dans les fichiers `stock_data_2022_long.csv` et `stock_data_2023_long.csv`. L'objectif du projet est d'estimer les paramètres $\alpha$, $\beta$ et $\sigma$ à partir de notre modèle et de faire des simulations du modèle qu'on comparera avec les prix des actions pour les deux années.
+
+### 1.1 Préparation des données
+
+Dans un premier temps, nous allons importer et préparer nos données. Les fichiers `stock_data_2022.csv` et `stock_data_2023.csv` ne sont pas directement dans un format tidy et on doit vérifier la présence de valeurs manquantes. Ainsi, nous devons effectuer quelques transformations :
+
+1.  Mettre en format date pour les deux jeux de données.
+
+2.  Séparer la variable `Observation_Type` en cinq variables distinctes : `Price1`, `Price2`, `Price3`, `Volume` et `Sentiment`, en utilisant la colonne `Value`.
+
+3.  Convertir les types des variables `Price1`, `Price2`, `Price3`, `Volume` en **double**.
+
+4.  Vérifier s'il y a des valeurs manquantes.
+
+Les étapes suivantes détaillent ces transformations à l’aide de la librairie `tidyverse`.
+
+```{r}
+data22 <- read.csv("stock_data_2022.csv")
+data23 <- read.csv("stock_data_2023.csv")
+
+options(warn=-1)  #supprimer les messages 
+suppressPackageStartupMessages({
+  suppressWarnings(library(tidyverse))
+})
+library(tidyverse)
+
+# Transformer en format large
+data22 <- data22 %>%
+  pivot_wider(names_from = Observation_Type, values_from = Value)
+
+data23 <- data23 %>%
+  pivot_wider(names_from = Observation_Type, values_from = Value)
+
+# Convertir correctement les types des variables
+data22 <- data22 %>%
+  mutate(
+    Price1 = as.double(Price1),
+    Price2 = as.double(Price2),
+    Price3 = as.double(Price3),
+    Volume = as.double(Volume),
+    Date=as.Date(Date)
+  )
+
+data23 <- data23 %>%
+  mutate(
+    Price1 = as.double(Price1),
+    Price2 = as.double(Price2),
+    Price3 = as.double(Price3),
+    Volume = as.double(Volume),
+    Date = as.Date(Date,format = "%d/%m/%Y" ) #il n'était pas dans le bon format
+  )
+
+# Visualisation une partie des données 
+#head(data22)
+#head(data23)
+#View(data22)
+#View(data23)
+
+# Jointure des deux jeux de données
+data_final <- bind_rows(data22, data23)
+
+# Vérification des valeurs manquantes 
+#data_final %>%
+  #summarise(across(everything(), ~ sum(is.na(.))))
+```
+
+### 1.2 Structure de notre jeu de données
+
+Une fois ces transformations réalisées, le jeu de données `data_final` contient les colonnes suivantes :
+
+-   **Date** : La date de l'observation.
+
+-   **Price1, Price2, Price3** : Les prix des trois actions.
+
+-   **Volume** : Le volume des transactions.
+
+-   **Sentiment** : Le sentiment du marché (positif, négatif, neutre).
+
+Chaque ligne correspond à une observation pour un jour donné, et le dataframe est structuré sous forme **tidy**, ce qui signifie que chaque observation occupe une ligne, et chaque variable occupe une colonne. Ce format nous permet d'appliquer facilement des techniques d'analyse statistique et de modélisation.
+
+### 1.3 Exploration visuelle des données
+
+Avant de procéder à l’estimation des paramètres du modèle, il est utile d’explorer visuellement les données. Cela permet de mieux comprendre l’évolution des prix au cours du temps, ainsi que la distribution des sentiments du marché.
+
+#### 1.3.1 Évolution des prix des actions
+
+Nous commençons par représenter les trois séries de prix (`Price1`, `Price2`, `Price3`) en fonction du temps :
+
+```{r}
+data_final_long <- data_final %>%
+  pivot_longer(cols = starts_with("Price"), names_to = "Stock", values_to = "Price")
+
+ggplot(data_final_long, aes(x = Date, y = Price, color = Stock)) +
+  geom_line() +
+  labs(title = "Évolution des prix des actions (2022–2023)", x = "Date", y = "Prix") +
+  theme_minimal()
+
+```
+
+Ces données seront comparées avec les résultats obtenus par le modèle proposé.
+
+#### 1.3.2 Distribution des sentiments du marché
+
+Nous pouvons ensuite visualiser la répartition des sentiments (positif, neutre, négatif) à travers une variable catégorielle.
+
+```{r}
+ggplot(data_final, aes(x = Sentiment, fill = Sentiment)) +
+  geom_bar() +
+  labs(title = "Distribution du sentiment du marché", x = "Sentiment", y = "Nombre d'observations") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Positive" = "green", "Neutral" = "gray", "Negative" = "red"))
+
+```
+
+En observant la distribution du sentiment dans notre jeu de données, on constate un **équilibre assez marqué entre les sentiments positifs et négatifs**, chaque catégorie ayant un nombre similaire d’observations. De plus, il y a également un **nombre non négligeable d’observations neutres**, ce qui suggère que le marché a tendance à adopter une position plus indécise dans de nombreuses situations. Cette répartition pourrait refléter un environnement économique où les investisseurs sont partagés entre optimisme et pessimisme, avec cependant une proportion importante d'incertitude ou d'attentisme.
+
+### 1.4 Objectif de l'analyse
+
+Avec ce nouveau jeu de données, nous chercherons à estimer les paramètres du modèle, à savoir $\alpha$, $\beta$ et $\sigma$, en utilisant la fonction de vraisemblance associée aux prix des actions. Ces estimations nous permettront d’évaluer la capacité du modèle à reproduire les dynamiques observées sur les marchés financiers, ce qui présente un intérêt majeur pour les investisseurs et les analystes.
+
+## 2) La log-vraisemblance du modèle
+
+Le modèle que nous utilisons est basé sur l’hypothèse que les prix des actions suivent une dynamique décrite par l’expression suivante :
+
+$$ P_t = P_{t-1} + P_{t-1} (\alpha + \beta (P_{t-1} - P_{t-2}) + \epsilon_t) $$
+
+où $\epsilon_t \sim \mathcal{N}(0, \sigma^2)$, nous cherchons à exprimer la vraisemblance de notre modèle pour les paramètres $\alpha$, $\beta$ et $\sigma$ donnée par :
+
+$$ \mathcal{L}_{\alpha, \beta, \sigma}(P_3, ..., P_T \mid P_1, P_2)$$
+
+En appliquant la règle des probabilités conditionnelles, on peut décomposer cette probabilité comme suit :
+
+$$  
+\mathcal{L}_{\alpha, \beta, \sigma}(P_3, ..., P_T \mid P_1, P_2) = \mathcal{L}_{\alpha, \beta, \sigma}(P_T \mid P_{T-1}, ..., P_3, P_2, P_1) \mathcal{L}_{\alpha, \beta, \sigma}(P_{T-1}, ..., P_3 \mid P_1, P_2)=
+$$ $$
+\mathcal{L}_{\alpha, \beta, \sigma}(P_T \mid P_{T-1}, P_{T-2}) \mathcal{L}_{\alpha, \beta, \sigma}(P_{T-1}, ..., P_3 \mid P_1, P_2).  
+$$
+
+En répétant cette décomposition de manière itérative jusqu'à $t = 3$, on obtient finalement :
+
+$$  
+\mathcal{L}_{\alpha, \beta, \sigma}(P_3, ..., P_T \mid P_1, P_2) = \prod_{t=3}^{T} \mathcal{L}_{\alpha, \beta, \sigma}(P_t \mid P_{t-1}, P_{t-2}).  
+$$
+
+De plus, on a que :
+
+$$
+P_t \mid (P_{t-1}, P_{t-2}) \sim \mathcal{N}(\mathbb{E}[P_t], \text{Var}(P_t))
+$$
+
+### 2.1 Calcul de l'espérance conditionnelle
+
+$$
+\mathbb{E}[P_t \mid P_{t-1}, P_{t-2}] = \mathbb{E} \left[ P_{t-1} + P_{t-1} (\alpha + \beta (P_{t-1} - P_{t-2}) + \epsilon_t) \right]
+$$
+
+En utilisant la linéarité de l'espérance et sachant que $\mathbb{E}[\epsilon_t] = 0$, on obtient :
+
+$$
+\mathbb{E}[P_t \mid P_{t-1}, P_{t-2}] = P_{t-1} + P_{t-1} (\alpha + \beta (P_{t-1} - P_{t-2}))
+$$
+
+### 2.2. Calcul de la variance conditionnelle
+
+Puisque $\epsilon_t \sim \mathcal{N}(0, \sigma^2)$, on a :
+
+$$
+\text{Var}(P_t \mid P_{t-1}, P_{t-2}) = \text{Var} \left(P_{t-1} + P_{t-1} (\alpha + \beta (P_{t-1} - P_{t-2}) + \epsilon_t) \right)
+$$
+
+Comme seul $\epsilon_t$ est aléatoire et que $P_{t-1}$ est un facteur multiplicatif, on obtient :
+
+$$
+\text{Var}(P_t \mid P_{t-1}, P_{t-2}) = P_{t-1}^2 \sigma^2
+$$
+
+Ainsi, chaque transition suit la loi normale :
+
+$$
+P_t \mid (P_{t-1}, P_{t-2}) \sim \mathcal{N} \left(P_{t-1} + P_{t-1} (\alpha + \beta (P_{t-1} - P_{t-2})), P_{t-1}^2 \sigma^2 \right)
+$$
+
+### 2.3 Écriture de la log-vraisemblance
+
+Par la décomposition précédente, la vraisemblance du modèle est donnée par :
+
+$$
+\mathcal{L}_{\alpha, \beta, \sigma}(P_3, ..., P_T \mid P_1, P_2) = \prod_{t=3}^{T} \frac{1}{\sqrt{2\pi P_{t-1}^2 \sigma^2}} \exp \left(-\frac{(P_t - P_{t-1} - P_{t-1} (\alpha + \beta (P_{t-1} - P_{t-2})))^2}{2 P_{t-1}^2 \sigma^2} \right)
+$$
+
+En prenant le logarithme, on retrouve :
+
+$$
+\log \mathcal{L}_{\alpha, \beta, \sigma}(P_3, ..., P_T \mid P_1,P_2) = -\sum_{t=3}^{T} \left[ \frac{1}{2} \log (2\pi P_{t-1}^2 \sigma^2) + \frac{(P_t - P_{t-1} - P_{t-1} (\alpha + \beta (P_{t-1} - P_{t-2})))^2}{2 P_{t-1}^2 \sigma^2} \right]
+$$
+
+------------------------------------------------------------------------
+
+### 2.4. Implémentation de la fonction log-vraisemblance et test sur une série de prix $P_t$.
+
+```{r}
+logV <- function(params, price) 
+{
+  alpha = params[1]
+  beta = params[2]
+  sigma = params[3]
+  
+  if (sigma <= 0)
+  {
+    return(Inf)  # Éviter les valeurs négatives de sigma
+  }
+  
+  logvraisemblance = 0
+  T = length(price)
+  
+  for (t in 3:T) {
+    mu <- price[t-1] * (1 + alpha + beta * (price[t-1] - price[t-2]))
+    var <- (sigma * price[t-1])^2
+    
+    logvraisemblance = logvraisemblance - (
+      0.5 * log(2 * pi * var) + 
+      (price[t] - mu)^2 / (2 * var))
+  }
+  
+  return(logvraisemblance)  
+}
+
+#test
+logV(c(0.05, 0.05, 0.05),data_final$Price1)
+```
+
+## 3) Écriture de la log-vraisemblance pour 3 séries de prix indépendantes
+
+Étant donné que nous avons trois séries de prix indépendantes $( P_t^{(1)}, P_t^{(2)}, P_t^{(3)} )$,\
+la vraisemblance du modèle est le produit des vraisemblances individuelles :
+
+$$
+\mathcal{L}_{total} = \prod_{i=1}^{3}\mathcal{L}_{\alpha, \beta, \sigma}(P_3^{(i)}, ..., P_T^{(i)} \mid P_1^{(i)}, P_2^{(i)})
+$$
+
+Ainsi, la log-vraisemblance totale est simplement la **somme des log-vraisemblances individuelles**.
+
+De plus, chaque série suit une loi normale conditionnelle :
+
+$$
+P_t^{(i)} | (P_{t-1}^{(i)}, P_{t-2}^{(i)}) \sim \mathcal{N}\left(P_{t-1}^{(i)} + P_{t-1}^{(i)}( \alpha + \beta (P_{t-1}^{(i)} - P_{t-2}^{(i)})), P_{t-1}^{(i)2} \sigma^2 \right)
+$$
+
+En appliquant la même décomposition que précédemment pour chaque série, on obtient la log-vraisemblance totale :
+
+$$
+\log \mathcal{L}_{\text{total}} = - \sum_{i=1}^{3} \sum_{t=3}^{T} \left[ \frac{1}{2} \log(2 \pi P_{t-1}^{(i)2} \sigma^2) + \frac{(P_t^{(i)} - P_{t-1}^{(i)} - P_{t-1}^{(i)}(\alpha + \beta (P_{t-1}^{(i)} - P_{t-2}^{(i)})))^2}{2 P_{t-1}^{(i)2} \sigma^2} \right]
+$$
+
+### 3.1 Implémentation de la fonction log-vraisemblance pour 3 séries en R
+
+```{r}
+logV_multi <- function(params, price1, price2, price3) {
+  alpha = params[1]
+  beta  = params[2]
+  sigma = params[3]
+  
+
+  if (sigma <= 0) {
+    return(Inf)  # Éviter les valeurs négatives de sigma
+  }
+
+  logvraisemblance_total = 0
+
+  for (price in list(price1, price2, price3)) {
+    T <- length(price)
+    
+    for (t in 3:T) {
+      mu  <- price[t-1] * (1 + alpha + beta * (price[t-1] - price[t-2]))
+      var <- (sigma * price[t-1])^2
+
+      logvraisemblance_total <- logvraisemblance_total - (
+        0.5 * log(2 * pi * var) + 
+        (price[t] - mu)^2 / (2 * var)
+      )
+    }
+  }
+
+  return(logvraisemblance_total)
+}
+
+# Test de la fonction
+logV_multi(c(0.001, 0.001, 0.001), data_final$Price1, data_final$Price2, data_final$Price3)
+```
+
+## 4. Estimation des paramètres $\alpha$, $\beta$ et $\sigma$ par maximum de vraisemblance
+
+L'objectif est d'estimer les paramètres $\alpha, \beta, \sigma$ en maximisant la log-vraisemblance obtenue précédemment, qui repose sur un plus grand nombre d'observations, ce qui permet d'obtenir une estimation plus fiable des paramètres par rapport à celle obtenue à la question 2.
+
+### 4.1 Principe de l'estimation par maximum de vraisemblance (EMV)
+
+L'estimateur du maximum de vraisemblance (EMV) est défini comme :
+
+$$
+(\hat{\alpha}, \hat{\beta}, \hat{\sigma}) = \arg \max_{\alpha, \beta, \sigma} \log \mathcal{L}_{total}
+$$
+
+où $\log \mathcal L _{\text{total}}$ est la somme des log-vraisemblances individuelles :
+
+\$\$
+
+$$
+\log \mathcal{L}_{\text{total}} = - \sum_{i=1}^{3} \sum_{t=3}^{T} \left[ \frac{1}{2} \log(2 \pi P_{t-1}^{(i)2} \sigma^2) + \frac{(P_t^{(i)} - P_{t-1}^{(i)} - P_{t-1}^{(i)}(\alpha + \beta (P_{t-1}^{(i)} - P_{t-2}^{(i)})))^2}{2 P_{t-1}^{(i)2} \sigma^2} \right]
+$$
+
+\$\$
+
+La maximisation de cette fonction peut être réalisée numériquement en utilisant l'algorithme **optimisation par `optim()`**.
+
+```{r}
+# Fonction de vraisemblance à maximiser (on prend le négatif car optim() fait une minimisation)
+to_minimise_logV_multi <- function(params, price1, price2, price3) {
+  return(-logV_multi(params, data_final$Price1, data_final$Price2, data_final$Price3))  # Négatif pour maximiser
+}
+
+# Estimation des paramètres avec l'optimiseur de R pour 3 séries
+estimation <- optim(c(.5,.5,.5),to_minimise_logV_multi)  # Fonction à minimiser
+
+# Affichage des résultats
+cat("Estimation des paramètres pour les 3 séries :\n")
+cat("α =", estimation$par[1], "\n")
+cat("β =", estimation$par[2], "\n")
+cat("σ =", estimation$par[3], "\n")
+```
+
+## 5) Simulation des séries de prix à l’aide du modèle estimé
+
+Dans cette dernière partie, nous cherchons à **vérifier si le modèle que nous avons construit permet de reproduire correctement les dynamiques observées dans les données réelles**. Pour cela, nous simulons des trajectoires de prix pour chacune des trois actions, en utilisant les **paramètres estimés par maximum de vraisemblance**.
+
+Les paramètres à utiliser sont les suivants :
+
+-   $\hat{\alpha}$ = 0.00135381
+
+-   $\hat{\beta}$ ​= 0.0006594138
+
+-   $\hat{\sigma}$ = 0.01988731
+
+Nous fixons les deux premières valeurs de chaque série simulée à celles observées dans les données réelles ($P_1$ et $P_2$​), puis nous générons les valeurs suivantes selon le modèle :
+
+$$ P_t = P_{t-1} + P_{t-1} (\alpha + \beta (P_{t-1} - P_{t-2}) + \epsilon_t)  $$
+
+avec $\epsilon_t \sim \mathcal{N}(0, \sigma^2)$.
+
+Cette procédure est répétée indépendamment pour les trois séries de prix. On compare ensuite graphiquement les séries simulées avec les séries observées afin d’évaluer la pertinence du modèle.
+
+### 5.1 Simulation du modèle pour la première action
+
+```{r}
+library(ggplot2)
+
+# Fonction de simulation des prix
+simulation <- function(alpha, beta, sigma, P_1, P_2, Taille) {
+  P_thq=c() 
+  P_thq[1] <- P_1
+  P_thq[2] <- P_2
+  
+  # Simulation des prix
+  for(t in 3:Taille) {
+    P_thq[t] <- P_thq[t-1] * (1 + alpha + beta * (P_thq[t-1] - P_thq[t-2]) + rnorm(1, 0, sigma))
+  }
+  
+  return(P_thq)
+}
+
+# Simulation des prix avec les paramètres donnés pour le premier prix sur les 2 ans
+data_sim_Price1 <- simulation(
+  alpha = 0.00135381, beta = 0.0006594138, sigma = 0.01988731,
+  P_1 = data_final$Price1[1],  # Premier prix réel
+  P_2 = data_final$Price1[2],  # Deuxième prix réel
+  Taille = length(data_final$Price1)  # Taille de la série
+)
+
+# Création du dataframe pour ggplot
+df <- data.frame(
+  Temps = data_final$Date,
+  Prix_Reel = data_final$Price1,
+  Prix_Simule = data_sim_Price1
+)
+
+# Tracer les courbes avec ggplot
+ggplot(df, aes(x = Temps)) +
+  geom_line(aes(y = Prix_Reel, color = "Prix réel")) +
+  geom_line(aes(y = Prix_Simule, color = "Prix simulé")) +
+  labs(title = "Comparaison des séries temporelles pour Price1", x = "Temps", y = "Prix") +
+  scale_color_manual(values = c("Prix réel" = "blue", "Prix simulé" = "red")) +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+```
+
+### 5.2 Simulation du modèle pour la deuxième action
+
+```{r}
+# Simulation des prix avec les paramètres donnés pour le premier prix sur les 2 ans
+data_sim_Price2 <- simulation(
+  alpha = 0.00135381, beta = 0.0006594138, sigma = 0.01988731,
+  P_1 = data_final$Price2[1],  # Premier prix réel
+  P_2 = data_final$Price2[2],  # Deuxième prix réel
+  Taille = length(data_final$Price2)  # Taille de la série
+)
+
+# Création du dataframe pour ggplot
+df <- data.frame(
+  Temps = data_final$Date,
+  Prix_Reel = data_final$Price2,
+  Prix_Simule = data_sim_Price2
+)
+
+# Tracer les courbes avec ggplot
+ggplot(df, aes(x = Temps)) +
+  geom_line(aes(y = Prix_Reel, color = "Prix réel")) +
+  geom_line(aes(y = Prix_Simule, color = "Prix simulé")) +
+  labs(title = "Comparaison des séries temporelles pour Price2", x = "Temps", y = "Prix") +
+  scale_color_manual(values = c("Prix réel" = "blue", "Prix simulé" = "red")) +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+
+
+```
+
+### 5.3 Simulation du modèle pour la troisième action
+
+```{r}
+# Simulation des prix avec les paramètres donnés pour le premier prix sur les 2 ans
+data_sim_Price3 <- simulation(
+  alpha = 0.00135381, beta = 0.0006594138, sigma = 0.01988731,
+  P_1 = data_final$Price3[1],  # Premier prix réel
+  P_2 = data_final$Price3[2],  # Deuxième prix réel
+  Taille = length(data_final$Price3)  # Taille de la série
+)
+
+# Création du dataframe pour ggplot
+df <- data.frame(
+  Temps = data_final$Date,
+  Prix_Reel = data_final$Price3,
+  Prix_Simule = data_sim_Price3
+)
+
+# Tracer les courbes avec ggplot
+ggplot(df, aes(x = Temps)) +
+  geom_line(aes(y = Prix_Reel, color = "Prix réel")) +
+  geom_line(aes(y = Prix_Simule, color = "Prix simulé")) +
+  labs(title = "Comparaison des séries temporelles pour Price3", x = "Temps", y = "Prix") +
+  scale_color_manual(values = c("Prix réel" = "blue", "Prix simulé" = "red")) +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+```
+
+### 5.4 Analyse des simulations
+
+On constate que **le modèle ne parvient pas à reproduire correctement l’évolution des prix**. Les trajectoires générées sont souvent éloignées des courbes observées, et les comportements réels (comme les variations brusques) ne sont pas captés.
+
+Cela suggère que, malgré une construction cohérente sur le plan théorique, **le modèle est trop simple pour représenter de manière satisfaisante des données financières réelles**
+
+## 6. Conclusion
+
+Ce projet a permis de tester un modèle stochastique simple pour les prix boursiers. La formulation mathématique, et l’implémentation en R permet d’effectuer correctement l’estimation par maximum de vraisemblance.
+
+Cependant, les simulations montrent que **le modèle ne fournit pas de bonnes prévisions**, ce qui remet en question sa pertinence dans un cadre réel. Cela s'explique notamment par :
+
+-   la **simplicité du modèle** (trois paramètres, dépendance uniquement aux deux jours précédents),
+
+-   l'absence de quelques phénomènes importants qu'on ignore.
+
+Ce travail met en évidence les limites d’un modèle simple dans un contexte aussi complexe que la finance, tout en montrant qu’il est possible d’estimer et d’évaluer un tel modèle de manière rigoureuse.
